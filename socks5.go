@@ -47,8 +47,10 @@ type Config struct {
 	Logger *log.Logger
 
 	// Optional function for dialing out
-	Dial func(ctx context.Context, network, addr string) (net.Conn, error)
+	Dial DialFunc
 }
+
+type DialFunc func(ctx context.Context, network, addr string) (net.Conn, error)
 
 // Server is reponsible for accepting connections and handling
 // the details of the SOCKS5 protocol
@@ -114,7 +116,6 @@ func (s *Server) Serve(l net.Listener) error {
 		}
 		go s.ServeConn(conn)
 	}
-	return nil
 }
 
 // ServeConn is used to serve a single connection.

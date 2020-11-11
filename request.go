@@ -1,6 +1,7 @@
 package socks5
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -33,6 +34,7 @@ const (
 
 var (
 	unrecognizedAddrType = fmt.Errorf("Unrecognized address type")
+	ErrParsingAddrSpec   = errors.New("err parsing AddrSpec from net.Addr")
 )
 
 // AddressRewriter is used to rewrite a destination transparently
@@ -92,11 +94,6 @@ func NewRequest(bufConn io.Reader) (*Request, error) {
 	header := []byte{0, 0, 0}
 	if _, err := io.ReadAtLeast(bufConn, header, 3); err != nil {
 		return nil, fmt.Errorf("Failed to get command version: %v", err)
-	}
-
-	// Ensure we are compatible
-	if header[0] != socks5Version {
-		return nil, fmt.Errorf("Unsupported command version: %v", header[0])
 	}
 
 	// Read in the destination address
@@ -168,12 +165,7 @@ func (s *Server) handleConnect(ctx context.Context, conn conn, req *Request) err
 	}
 
 	// Attempt to connect
-	dial := s.config.Dial
-	if dial == nil {
-		dial = func(ctx context.Context, net_, addr string) (net.Conn, error) {
-			return net.Dial(net_, addr)
-		}
-	}
+	dial := s.getDial()
 	target, err := dial(ctx, "tcp", req.realDestAddr.Address())
 	if err != nil {
 		msg := err.Error()
@@ -191,26 +183,18 @@ func (s *Server) handleConnect(ctx context.Context, conn conn, req *Request) err
 	defer target.Close()
 
 	// Send success
-	local := target.LocalAddr().(*net.TCPAddr)
-	bind := AddrSpec{IP: local.IP, Port: local.Port}
-	if err := sendReply(conn, successReply, &bind); err != nil {
+	local := addrSpecFromNetAddr(target.LocalAddr())
+	if local == nil {
+		if err := sendReply(conn, serverFailure, nil); err != nil {
+			return fmt.Errorf("Failed to parse AddrSpec from net.Addr: %v", target.LocalAddr())
+		}
+		return ErrParsingAddrSpec
+	}
+
+	if err := sendReply(conn, successReply, local); err != nil {
 		return fmt.Errorf("Failed to send reply: %v", err)
 	}
-
-	// Start proxying
-	errCh := make(chan error, 2)
-	go proxy(target, req.bufConn, errCh)
-	go proxy(conn, target, errCh)
-
-	// Wait
-	for i := 0; i < 2; i++ {
-		e := <-errCh
-		if e != nil {
-			// return from this function closes target (and conn).
-			return e
-		}
-	}
-	return nil
+	return s.startProxy(target, conn, target, req.bufConn)
 }
 
 // handleBind is used to handle a connect command
@@ -225,11 +209,37 @@ func (s *Server) handleBind(ctx context.Context, conn conn, req *Request) error 
 		ctx = ctx_
 	}
 
-	// TODO: Support bind
-	if err := sendReply(conn, commandNotSupported, nil); err != nil {
+	// Attempt to connect
+	dial := s.getDial()
+	target, err := dial(ctx, "tcp", fmt.Sprintf(":%d", req.realDestAddr.Port))
+	if err != nil {
+		msg := err.Error()
+		resp := hostUnreachable
+		if strings.Contains(msg, "refused") {
+			resp = connectionRefused
+		} else if strings.Contains(msg, "network is unreachable") {
+			resp = networkUnreachable
+		}
+		if err := sendReply(conn, resp, nil); err != nil {
+			return fmt.Errorf("Failed to send reply: %v", err)
+		}
+		return fmt.Errorf("Connect to %v failed: %v", req.DestAddr, err)
+	}
+	defer target.Close()
+
+	// Send success
+	local := addrSpecFromNetAddr(target.LocalAddr())
+	if local == nil {
+		if err := sendReply(conn, serverFailure, nil); err != nil {
+			return fmt.Errorf("Failed to parse AddrSpec from net.Addr: %v", target.LocalAddr())
+		}
+		return ErrParsingAddrSpec
+	}
+
+	if err := sendReply(conn, successReply, local); err != nil {
 		return fmt.Errorf("Failed to send reply: %v", err)
 	}
-	return nil
+	return s.startProxy(target, conn, target, req.bufConn)
 }
 
 // handleAssociate is used to handle a connect command
@@ -358,7 +368,44 @@ type closeWriter interface {
 func proxy(dst io.Writer, src io.Reader, errCh chan error) {
 	_, err := io.Copy(dst, src)
 	if tcpConn, ok := dst.(closeWriter); ok {
-		tcpConn.CloseWrite()
+		_ = tcpConn.CloseWrite()
 	}
 	errCh <- err
+}
+
+// getDial return dial from config or create
+func (s *Server) getDial() DialFunc {
+	dial := s.config.Dial
+	if dial == nil {
+		dial = func(ctx context.Context, net_, addr string) (net.Conn, error) {
+			return net.Dial(net_, addr)
+		}
+	}
+	return dial
+}
+
+// startProxy starts the communication process between local and remote connections
+func (Server) startProxy(targetWriter, localWriter io.Writer, targetReader, localReader io.Reader) error {
+	// Start proxying
+	errCh := make(chan error, 2)
+	go proxy(targetWriter, localReader, errCh)
+	go proxy(localWriter, targetReader, errCh)
+
+	// Wait
+	for i := 0; i < 2; i++ {
+		e := <-errCh
+		if e != nil {
+			// return from this function closes target (and conn).
+			return e
+		}
+	}
+	return nil
+}
+
+//addrSpecFromNetAddr secure parsing net.Addr to AddrSpec or nil returning
+func addrSpecFromNetAddr(addr net.Addr) *AddrSpec {
+	if tcpAddr, ok := addr.(*net.TCPAddr); ok {
+		return &AddrSpec{IP: tcpAddr.IP, Port: tcpAddr.Port}
+	}
+	return nil
 }
