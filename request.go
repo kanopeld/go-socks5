@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"strings"
+	"sync"
 )
 
 const (
@@ -34,6 +35,11 @@ var (
 	unrecognizedAddrType = fmt.Errorf("Unrecognized address type")
 	ErrParsingAddrSpec   = errors.New("err parsing AddrSpec from net.Addr")
 )
+
+type conn interface {
+	Write(b []byte) (int, error)
+	RemoteAddr() net.Addr
+}
 
 // A Request represents request received by a server
 type Request struct {
@@ -77,7 +83,7 @@ func NewRequest(bufConn io.Reader) (*Request, error) {
 }
 
 // handleRequest is used for request processing after authentication
-func (s *Server) handleRequest(req *Request, conn net.Conn) error {
+func (s *Server) handleRequest(req *Request, conn conn) error {
 	ctx := context.Background()
 
 	// Resolve the address if we have a FQDN
@@ -117,7 +123,7 @@ func (s *Server) handleRequest(req *Request, conn net.Conn) error {
 }
 
 // handleConnect is used to handle a connect command
-func (s *Server) handleConnect(ctx context.Context, conn net.Conn, req *Request) error {
+func (s *Server) handleConnect(ctx context.Context, conn conn, req *Request) error {
 	// Check if this is allowed
 	if ctx_, ok := s.config.Rules.Allow(ctx, req); !ok {
 		if err := sendReply(conn, ruleFailure, nil); err != nil {
@@ -164,11 +170,11 @@ func (s *Server) handleConnect(ctx context.Context, conn net.Conn, req *Request)
 	if err := sendReply(conn, successReply, local); err != nil {
 		return fmt.Errorf("Failed to send reply: %v", err)
 	}
-	return s.startProxy(target, conn, target, req.bufConn)
+	return startProxy(target, conn, target, req.bufConn)
 }
 
 // handleBind is used to handle a connect command
-func (s *Server) handleBind(ctx context.Context, conn net.Conn, req *Request) error {
+func (s *Server) handleBind(ctx context.Context, conn conn, req *Request) error {
 	// Check if this is allowed
 	if ctx_, ok := s.config.Rules.Allow(ctx, req); !ok {
 		if err := sendReply(conn, ruleFailure, nil); err != nil {
@@ -179,7 +185,14 @@ func (s *Server) handleBind(ctx context.Context, conn net.Conn, req *Request) er
 		ctx = ctx_
 	}
 
-	ln, err := net.Listen("tcp", fmt.Sprintf(":%d", req.realDestAddr.Port))
+	listener := s.config.Listener
+	if listener == nil {
+		listener = func(ctx context.Context, network, port string) (net.Listener, error) {
+			return net.Listen(network, port)
+		}
+	}
+
+	ln, err := listener(ctx, "tcp", fmt.Sprintf(":%d", req.realDestAddr.Port))
 	if err != nil || ln == nil {
 		if err := sendReply(conn, serverFailure, nil); err != nil {
 			return fmt.Errorf("Failed to parse AddrSpec from net.Addr: %v", ln.Addr().String())
@@ -195,18 +208,33 @@ func (s *Server) handleBind(ctx context.Context, conn net.Conn, req *Request) er
 		return ErrParsingAddrSpec
 	}
 
-	listener := newBindListener(ln, conn)
-
 	if err := sendReply(conn, successReply, local); err != nil {
 		return fmt.Errorf("Failed to send reply: %v", err)
 	}
 
-	go listener.start()
+	go func() {
+		mux := new(sync.Mutex)
+		local := conn.(net.Conn)
+
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				mux.Lock()
+				defer mux.Unlock()
+
+				startProxy(local, conn, local, conn)
+			}()
+		}
+	}()
+
 	return nil
 }
 
 // handleAssociate is used to handle a connect command
-func (s *Server) handleAssociate(ctx context.Context, conn net.Conn, req *Request) error {
+func (s *Server) handleAssociate(ctx context.Context, conn conn, req *Request) error {
 	// Check if this is allowed
 	if ctx_, ok := s.config.Rules.Allow(ctx, req); !ok {
 		if err := sendReply(conn, ruleFailure, nil); err != nil {
@@ -239,7 +267,7 @@ func proxy(dst io.Writer, src io.Reader, errCh chan error) {
 }
 
 // startProxy starts the communication process between local and remote connections
-func (Server) startProxy(targetWriter, localWriter io.Writer, targetReader, localReader io.Reader) error {
+func startProxy(targetWriter, localWriter io.Writer, targetReader, localReader io.Reader) error {
 	// Start proxying
 	errCh := make(chan error, 2)
 	go proxy(targetWriter, localReader, errCh)

@@ -2,12 +2,11 @@ package socks5
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"log"
 	"net"
 	"os"
-
-	"golang.org/x/net/context"
 )
 
 const (
@@ -48,9 +47,13 @@ type Config struct {
 
 	// Optional function for dialing out
 	Dial DialFunc
+
+	Listener ListenerFunc
 }
 
 type DialFunc func(ctx context.Context, network, addr string) (net.Conn, error)
+
+type ListenerFunc func(ctx context.Context, network, port string) (net.Listener, error)
 
 // Server is reponsible for accepting connections and handling
 // the details of the SOCKS5 protocol
