@@ -1,14 +1,12 @@
 package socks5
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
 	"net"
-	"strconv"
 	"strings"
-
-	"golang.org/x/net/context"
 )
 
 const (
@@ -37,35 +35,6 @@ var (
 	ErrParsingAddrSpec   = errors.New("err parsing AddrSpec from net.Addr")
 )
 
-// AddressRewriter is used to rewrite a destination transparently
-type AddressRewriter interface {
-	Rewrite(ctx context.Context, request *Request) (context.Context, *AddrSpec)
-}
-
-// AddrSpec is used to return the target AddrSpec
-// which may be specified as IPv4, IPv6, or a FQDN
-type AddrSpec struct {
-	FQDN string
-	IP   net.IP
-	Port int
-}
-
-func (a *AddrSpec) String() string {
-	if a.FQDN != "" {
-		return fmt.Sprintf("%s (%s):%d", a.FQDN, a.IP, a.Port)
-	}
-	return fmt.Sprintf("%s:%d", a.IP, a.Port)
-}
-
-// Address returns a string suitable to dial; prefer returning IP-based
-// address, fallback to FQDN
-func (a AddrSpec) Address() string {
-	if 0 != len(a.IP) {
-		return net.JoinHostPort(a.IP.String(), strconv.Itoa(a.Port))
-	}
-	return net.JoinHostPort(a.FQDN, strconv.Itoa(a.Port))
-}
-
 // A Request represents request received by a server
 type Request struct {
 	// Protocol version
@@ -81,11 +50,6 @@ type Request struct {
 	// AddrSpec of the actual destination (might be affected by rewrite)
 	realDestAddr *AddrSpec
 	bufConn      io.Reader
-}
-
-type conn interface {
-	Write([]byte) (int, error)
-	RemoteAddr() net.Addr
 }
 
 // NewRequest creates a new Request from the tcp connection
@@ -113,7 +77,7 @@ func NewRequest(bufConn io.Reader) (*Request, error) {
 }
 
 // handleRequest is used for request processing after authentication
-func (s *Server) handleRequest(req *Request, conn conn) error {
+func (s *Server) handleRequest(req *Request, conn net.Conn) error {
 	ctx := context.Background()
 
 	// Resolve the address if we have a FQDN
@@ -153,7 +117,7 @@ func (s *Server) handleRequest(req *Request, conn conn) error {
 }
 
 // handleConnect is used to handle a connect command
-func (s *Server) handleConnect(ctx context.Context, conn conn, req *Request) error {
+func (s *Server) handleConnect(ctx context.Context, conn net.Conn, req *Request) error {
 	// Check if this is allowed
 	if ctx_, ok := s.config.Rules.Allow(ctx, req); !ok {
 		if err := sendReply(conn, ruleFailure, nil); err != nil {
@@ -165,7 +129,13 @@ func (s *Server) handleConnect(ctx context.Context, conn conn, req *Request) err
 	}
 
 	// Attempt to connect
-	dial := s.getDial()
+	dial := s.config.Dial
+	if dial == nil {
+		dial = func(ctx context.Context, net_, addr string) (net.Conn, error) {
+			return net.Dial(net_, addr)
+		}
+	}
+
 	target, err := dial(ctx, "tcp", req.realDestAddr.Address())
 	if err != nil {
 		msg := err.Error()
@@ -198,7 +168,7 @@ func (s *Server) handleConnect(ctx context.Context, conn conn, req *Request) err
 }
 
 // handleBind is used to handle a connect command
-func (s *Server) handleBind(ctx context.Context, conn conn, req *Request) error {
+func (s *Server) handleBind(ctx context.Context, conn net.Conn, req *Request) error {
 	// Check if this is allowed
 	if ctx_, ok := s.config.Rules.Allow(ctx, req); !ok {
 		if err := sendReply(conn, ruleFailure, nil); err != nil {
@@ -209,41 +179,34 @@ func (s *Server) handleBind(ctx context.Context, conn conn, req *Request) error 
 		ctx = ctx_
 	}
 
-	// Attempt to connect
-	dial := s.getDial()
-	target, err := dial(ctx, "tcp", fmt.Sprintf(":%d", req.realDestAddr.Port))
-	if err != nil {
-		msg := err.Error()
-		resp := hostUnreachable
-		if strings.Contains(msg, "refused") {
-			resp = connectionRefused
-		} else if strings.Contains(msg, "network is unreachable") {
-			resp = networkUnreachable
+	ln, err := net.Listen("tcp", fmt.Sprintf(":%d", req.realDestAddr.Port))
+	if err != nil || ln == nil {
+		if err := sendReply(conn, serverFailure, nil); err != nil {
+			return fmt.Errorf("Failed to parse AddrSpec from net.Addr: %v", ln.Addr().String())
 		}
-		if err := sendReply(conn, resp, nil); err != nil {
-			return fmt.Errorf("Failed to send reply: %v", err)
-		}
-		return fmt.Errorf("Connect to %v failed: %v", req.DestAddr, err)
 	}
-	defer target.Close()
+	defer ln.Close()
 
-	// Send success
-	local := addrSpecFromNetAddr(target.LocalAddr())
+	local := addrSpecFromNetAddr(ln.Addr())
 	if local == nil {
 		if err := sendReply(conn, serverFailure, nil); err != nil {
-			return fmt.Errorf("Failed to parse AddrSpec from net.Addr: %v", target.LocalAddr())
+			return fmt.Errorf("Failed to parse AddrSpec from net.Addr: %v", ln.Addr())
 		}
 		return ErrParsingAddrSpec
 	}
 
+	listener := newBindListener(ln, conn)
+
 	if err := sendReply(conn, successReply, local); err != nil {
 		return fmt.Errorf("Failed to send reply: %v", err)
 	}
-	return s.startProxy(target, conn, target, req.bufConn)
+
+	go listener.start()
+	return nil
 }
 
 // handleAssociate is used to handle a connect command
-func (s *Server) handleAssociate(ctx context.Context, conn conn, req *Request) error {
+func (s *Server) handleAssociate(ctx context.Context, conn net.Conn, req *Request) error {
 	// Check if this is allowed
 	if ctx_, ok := s.config.Rules.Allow(ctx, req); !ok {
 		if err := sendReply(conn, ruleFailure, nil); err != nil {
@@ -261,104 +224,6 @@ func (s *Server) handleAssociate(ctx context.Context, conn conn, req *Request) e
 	return nil
 }
 
-// readAddrSpec is used to read AddrSpec.
-// Expects an address type byte, follwed by the address and port
-func readAddrSpec(r io.Reader) (*AddrSpec, error) {
-	d := &AddrSpec{}
-
-	// Get the address type
-	addrType := []byte{0}
-	if _, err := r.Read(addrType); err != nil {
-		return nil, err
-	}
-
-	// Handle on a per type basis
-	switch addrType[0] {
-	case ipv4Address:
-		addr := make([]byte, 4)
-		if _, err := io.ReadAtLeast(r, addr, len(addr)); err != nil {
-			return nil, err
-		}
-		d.IP = net.IP(addr)
-
-	case ipv6Address:
-		addr := make([]byte, 16)
-		if _, err := io.ReadAtLeast(r, addr, len(addr)); err != nil {
-			return nil, err
-		}
-		d.IP = net.IP(addr)
-
-	case fqdnAddress:
-		if _, err := r.Read(addrType); err != nil {
-			return nil, err
-		}
-		addrLen := int(addrType[0])
-		fqdn := make([]byte, addrLen)
-		if _, err := io.ReadAtLeast(r, fqdn, addrLen); err != nil {
-			return nil, err
-		}
-		d.FQDN = string(fqdn)
-
-	default:
-		return nil, unrecognizedAddrType
-	}
-
-	// Read the port
-	port := []byte{0, 0}
-	if _, err := io.ReadAtLeast(r, port, 2); err != nil {
-		return nil, err
-	}
-	d.Port = (int(port[0]) << 8) | int(port[1])
-
-	return d, nil
-}
-
-// sendReply is used to send a reply message
-func sendReply(w io.Writer, resp uint8, addr *AddrSpec) error {
-	// Format the address
-	var addrType uint8
-	var addrBody []byte
-	var addrPort uint16
-	switch {
-	case addr == nil:
-		addrType = ipv4Address
-		addrBody = []byte{0, 0, 0, 0}
-		addrPort = 0
-
-	case addr.FQDN != "":
-		addrType = fqdnAddress
-		addrBody = append([]byte{byte(len(addr.FQDN))}, addr.FQDN...)
-		addrPort = uint16(addr.Port)
-
-	case addr.IP.To4() != nil:
-		addrType = ipv4Address
-		addrBody = []byte(addr.IP.To4())
-		addrPort = uint16(addr.Port)
-
-	case addr.IP.To16() != nil:
-		addrType = ipv6Address
-		addrBody = []byte(addr.IP.To16())
-		addrPort = uint16(addr.Port)
-
-	default:
-		return fmt.Errorf("Failed to format address: %v", addr)
-	}
-
-	// Format the message
-	msg := make([]byte, 6+len(addrBody))
-	msg[0] = socks5Version
-	msg[1] = resp
-	msg[2] = 0 // Reserved
-	msg[3] = addrType
-	copy(msg[4:], addrBody)
-	msg[4+len(addrBody)] = byte(addrPort >> 8)
-	msg[4+len(addrBody)+1] = byte(addrPort & 0xff)
-
-	// Send the message
-	_, err := w.Write(msg)
-	return err
-}
-
 type closeWriter interface {
 	CloseWrite() error
 }
@@ -371,17 +236,6 @@ func proxy(dst io.Writer, src io.Reader, errCh chan error) {
 		_ = tcpConn.CloseWrite()
 	}
 	errCh <- err
-}
-
-// getDial return dial from config or create
-func (s *Server) getDial() DialFunc {
-	dial := s.config.Dial
-	if dial == nil {
-		dial = func(ctx context.Context, net_, addr string) (net.Conn, error) {
-			return net.Dial(net_, addr)
-		}
-	}
-	return dial
 }
 
 // startProxy starts the communication process between local and remote connections
@@ -398,14 +252,6 @@ func (Server) startProxy(targetWriter, localWriter io.Writer, targetReader, loca
 			// return from this function closes target (and conn).
 			return e
 		}
-	}
-	return nil
-}
-
-//addrSpecFromNetAddr secure parsing net.Addr to AddrSpec or nil returning
-func addrSpecFromNetAddr(addr net.Addr) *AddrSpec {
-	if tcpAddr, ok := addr.(*net.TCPAddr); ok {
-		return &AddrSpec{IP: tcpAddr.IP, Port: tcpAddr.Port}
 	}
 	return nil
 }
