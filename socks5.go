@@ -4,7 +4,7 @@ import (
 	"bufio"
 	"context"
 	"fmt"
-	"log"
+	"github.com/sirupsen/logrus"
 	"net"
 	"os"
 )
@@ -43,7 +43,7 @@ type Config struct {
 
 	// Logger can be used to provide a custom log target.
 	// Defaults to stdout.
-	Logger *log.Logger
+	Logger *logrus.Logger
 
 	// Optional function for dialing out
 	Dial DialFunc
@@ -85,7 +85,8 @@ func New(conf *Config) (*Server, error) {
 
 	// Ensure we have a log target
 	if conf.Logger == nil {
-		conf.Logger = log.New(os.Stdout, "", log.LstdFlags)
+		conf.Logger = logrus.New()
+		conf.Logger.Out = os.Stdout
 	}
 
 	server := &Server{
@@ -105,8 +106,10 @@ func New(conf *Config) (*Server, error) {
 func (s *Server) ListenAndServe(network, addr string) error {
 	l, err := net.Listen(network, addr)
 	if err != nil {
+		s.log().WithField("err", err.Error()).Error("start listen")
 		return err
 	}
+	s.log().WithField("addr", addr).Info("listener started")
 	return s.Serve(l)
 }
 
@@ -115,8 +118,13 @@ func (s *Server) Serve(l net.Listener) error {
 	for {
 		conn, err := l.Accept()
 		if err != nil {
+			s.log().WithField("err", err.Error()).Debug("new connection")
 			return err
 		}
+		s.log().WithFields(logrus.Fields{
+			"addrR": conn.RemoteAddr().String(),
+			"addrL": conn.LocalAddr().String(),
+		}).Info("new connection")
 		go s.ServeConn(conn)
 	}
 }
@@ -129,22 +137,34 @@ func (s *Server) ServeConn(conn net.Conn) error {
 	// Read the version byte
 	version := []byte{0}
 	if _, err := bufConn.Read(version); err != nil {
-		s.config.Logger.Printf("[ERR] socks: Failed to get version byte: %v", err)
+		s.log().WithFields(logrus.Fields{
+			"addrR": conn.RemoteAddr().String(),
+			"addrL": conn.LocalAddr().String(),
+			"err":   err.Error(),
+		}).Error("failed to get version byte")
 		return err
 	}
 
 	// Ensure we are compatible
 	if version[0] != socks5Version {
-		err := fmt.Errorf("Unsupported SOCKS version: %v", version)
-		s.config.Logger.Printf("[ERR] socks: %v", err)
+		err := fmt.Errorf("unsupported SOCKS version: %v", version)
+		s.log().WithFields(logrus.Fields{
+			"addrR": conn.RemoteAddr().String(),
+			"addrL": conn.LocalAddr().String(),
+			"err":   err,
+		}).Error("socks")
 		return err
 	}
 
 	// Authenticate the connection
 	authContext, err := s.authenticate(conn, bufConn)
 	if err != nil {
-		err = fmt.Errorf("Failed to authenticate: %v", err)
-		s.config.Logger.Printf("[ERR] socks: %v", err)
+		err = fmt.Errorf("failed to authenticate: %v", err)
+		s.log().WithFields(logrus.Fields{
+			"addrR": conn.RemoteAddr().String(),
+			"addrL": conn.LocalAddr().String(),
+			"err":   err,
+		}).Error("socks")
 		return err
 	}
 
@@ -152,13 +172,21 @@ func (s *Server) ServeConn(conn net.Conn) error {
 	if err != nil {
 		if err == unrecognizedAddrType {
 			if err := sendReply(conn, addrTypeNotSupported, nil); err != nil {
-				err = fmt.Errorf("Failed to send reply: %v", err)
-				s.config.Logger.Printf("[ERR] socks: %v", err)
+				err = fmt.Errorf("failed to send reply: %v", err)
+				s.log().WithFields(logrus.Fields{
+					"addrR": conn.RemoteAddr().String(),
+					"addrL": conn.LocalAddr().String(),
+					"err":   err,
+				}).Error("socks")
 				return err
 			}
 		}
-		err = fmt.Errorf("Failed to read destination address: %v", err)
-		s.config.Logger.Printf("[ERR] socks: %v", err)
+		err = fmt.Errorf("failed to read destination address: %v", err)
+		s.log().WithFields(logrus.Fields{
+			"addrR": conn.RemoteAddr().String(),
+			"addrL": conn.LocalAddr().String(),
+			"err":   err,
+		}).Error("socks")
 		return err
 	}
 	request.AuthContext = authContext
@@ -168,9 +196,15 @@ func (s *Server) ServeConn(conn net.Conn) error {
 
 	// Process the client request
 	if err := s.handleRequest(request, conn); err != nil {
-		s.config.Logger.Printf("[INFO] waiting for jumpbox to be available...")
+		s.log().WithFields(logrus.Fields{
+			"addrR": conn.RemoteAddr().String(),
+			"addrL": conn.LocalAddr().String(),
+		}).Info("waiting for jumpbox to be available")
 		return err
 	}
-
 	return nil
+}
+
+func (s *Server) log() *logrus.Logger {
+	return s.config.Logger
 }
