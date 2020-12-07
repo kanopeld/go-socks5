@@ -18,6 +18,7 @@ func main() {
 	}
 	logger.SetLevel(level)
 
+	logger.Info("Logger started")
 	// Create a SOCKS5 server
 	conf := &socks5.Config{
 		Logger: logger,

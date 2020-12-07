@@ -3,6 +3,8 @@ github.com/kanopeld/go-socks5 v0.0.0-20180221174514-54f73bdb8a8e h1:rOS2vO/VYSXb
 github.com/kanopeld/go-socks5 v0.0.0-20180221174514-54f73bdb8a8e/go.mod h1:DR5fi9cPWAFjyROnq2o8Uh8bdfMxADUuoTqKDyKv7t0=
 github.com/kanopeld/go-socks5 v0.0.0-20201130154106-ea913070c40f h1:bnf2oi4asO1psNTadOyp+PZL5aQi5Qy4bVMeaK4BF8o=
 github.com/kanopeld/go-socks5 v0.0.0-20201130154106-ea913070c40f/go.mod h1:rBQpo7fwlY9dmwxIcdxFdGcrn+NEOGib5xJqAHga0QU=
+github.com/kanopeld/go-socks5 v0.0.0-20201207153728-bf509fc6d6c3 h1:GDUHvKYzK3f6Tmp1V7FPvW5WSEwDRI4BDXqMG9HArR4=
+github.com/kanopeld/go-socks5 v0.0.0-20201207153728-bf509fc6d6c3/go.mod h1:rBQpo7fwlY9dmwxIcdxFdGcrn+NEOGib5xJqAHga0QU=
 github.com/pmezard/go-difflib v1.0.0/go.mod h1:iKH77koFhYxTK1pcRnkKkqfTogsbg7gZNVY4sRDYZ/4=
 github.com/sirupsen/logrus v1.7.0 h1:ShrD1U9pZB12TX0cVy0DtePoCH97K8EtX+mg7ZARUtM=
 github.com/sirupsen/logrus v1.7.0/go.mod h1:yWOB1SBYBC5VeMP7gHvWumXLIWorT60ONWic61uBYv0=

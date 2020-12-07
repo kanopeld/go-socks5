@@ -7,7 +7,8 @@ ADD . /go/src/github.com/kanopeld/go-socks5/cmd
 WORKDIR /go/src/github.com/kanopeld/go-socks5/cmd
 RUN go mod download
 RUN go install github.com/kanopeld/go-socks5/cmd
+RUN chmod +x /go/src/github.com/kanopeld/go-socks5/cmd/docker-entrypoint.sh
 
-ENTRYPOINT ["PROXY_PORT=$PROXY_PORT LOG_LEVEL=$LOG_LEVEL /go/bin/cmd"]
+ENTRYPOINT ["/go/src/github.com/kanopeld/go-socks5/cmd/docker-entrypoint.sh"]
 
 EXPOSE $PROXY_PORT
